@@ -11,6 +11,8 @@ pub enum MessageType {
     // §1 Identity
     KeyRotate,
     KeyConflict,
+    DidLink,
+    DidRevoke,
     // §3 Transport
     AuthChallenge,
     AuthResponse,
@@ -51,6 +53,8 @@ impl MessageType {
                 | MessageType::ReputationGossip
                 | MessageType::KeyRotate
                 | MessageType::KeyConflict
+                | MessageType::DidLink
+                | MessageType::DidRevoke
         )
     }
 
@@ -60,7 +64,9 @@ impl MessageType {
             MessageType::PeerAnnounce
             | MessageType::ReputationGossip
             | MessageType::KeyRotate
-            | MessageType::KeyConflict => Some("/valence/peers"),
+            | MessageType::KeyConflict
+            | MessageType::DidLink
+            | MessageType::DidRevoke => Some("/valence/peers"),
 
             MessageType::Request
             | MessageType::Propose
