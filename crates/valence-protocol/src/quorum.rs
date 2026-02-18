@@ -92,7 +92,7 @@ pub fn evaluate_standard(
 /// Evaluate quorum for a constitutional proposal.
 pub fn evaluate_constitutional(
     votes: &[WeightedVote],
-    active_nodes: usize,
+    _active_nodes: usize,
     total_known_reputation: FixedPoint,
 ) -> QuorumResult {
     let (weighted_endorse, weighted_reject, weighted_abstain, total_voters) = tally(votes);

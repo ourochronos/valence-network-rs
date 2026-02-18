@@ -1,7 +1,6 @@
 //! Node identity — Ed25519 keypair management per §1.
 
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
-use sha2::{Digest, Sha256};
 
 /// A node's identity keypair.
 #[derive(Clone)]

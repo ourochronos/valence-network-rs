@@ -11,6 +11,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 valence-core = { workspace = true }
 valence-crypto = { workspace = true }
 valence-protocol = { workspace = true }

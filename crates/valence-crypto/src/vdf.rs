@@ -7,7 +7,7 @@
 //!   checkpoint[k] = h[k × checkpoint_interval]
 
 use sha2::{Digest, Sha256};
-use valence_core::constants::{VDF_CHECKPOINT_INTERVAL, VDF_DIFFICULTY, VDF_MIN_VERIFY_SEGMENTS};
+use valence_core::constants::{VDF_CHECKPOINT_INTERVAL, VDF_DIFFICULTY};
 
 /// A VDF proof with intermediate checkpoints.
 #[derive(Debug, Clone)]
