@@ -1,4 +1,4 @@
-//! Partition detection and merge per §11.
+//! Partition detection and merge per §12.
 
 use valence_core::canonical::merkle_root;
 use valence_core::constants;
@@ -109,6 +109,47 @@ pub struct ProtocolProposalInfo {
     pub id: String,
     pub voting_deadline_ms: i64,
     pub supersedes: Option<String>,
+}
+
+/// Content state merge: prefer the more "advanced" lifecycle state.
+/// Replicated > Hosted; GracePeriod > Replicated; Decayed > GracePeriod; Withdrawn wins over all non-Decayed.
+/// For same-variant: union semantics (keep the one with the later timestamp or higher miss count).
+pub fn merge_content_state(
+    a: crate::content::ContentState,
+    b: crate::content::ContentState,
+) -> crate::content::ContentState {
+    use crate::content::ContentState;
+    match (&a, &b) {
+        (ContentState::Decayed, _) | (_, ContentState::Decayed) => ContentState::Decayed,
+        (ContentState::Withdrawn { effective_after: ea }, ContentState::Withdrawn { effective_after: eb }) => {
+            // Earlier withdrawal wins (more conservative)
+            ContentState::Withdrawn { effective_after: (*ea).min(*eb) }
+        }
+        (ContentState::Withdrawn { .. }, _) => a,
+        (_, ContentState::Withdrawn { .. }) => b,
+        (ContentState::GracePeriod { entered_at: ea, miss_count: ma }, ContentState::GracePeriod { entered_at: eb, miss_count: mb }) => {
+            // Higher miss count wins (more conservative)
+            ContentState::GracePeriod {
+                entered_at: (*ea).min(*eb),
+                miss_count: (*ma).max(*mb),
+            }
+        }
+        (ContentState::GracePeriod { .. }, _) => a,
+        (_, ContentState::GracePeriod { .. }) => b,
+        (ContentState::Replicated { locked_multiplier: _lm_a, replication_timestamp: ts_a },
+         ContentState::Replicated { locked_multiplier: _lm_b, replication_timestamp: ts_b }) => {
+            // Keep earlier replication (first writer wins)
+            if ts_a <= ts_b { a } else { b }
+        }
+        (ContentState::Replicated { .. }, _) => a,
+        (_, ContentState::Replicated { .. }) => b,
+        _ => a, // Both Hosted
+    }
+}
+
+/// Identity merge: DID_REVOKE wins (revocation is permanent).
+pub fn merge_identity_state(_linked: bool, revoked: bool) -> bool {
+    revoked
 }
 
 #[cfg(test)]

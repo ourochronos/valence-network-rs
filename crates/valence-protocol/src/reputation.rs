@@ -1,4 +1,4 @@
-//! Reputation scoring and propagation per §8.
+//! Reputation scoring and propagation per §9.
 
 use valence_core::types::FixedPoint;
 use valence_core::constants::*;
@@ -59,6 +59,29 @@ impl ReputationState {
 
         // Hard cap at 1.0
         self.overall = self.overall.clamp(REPUTATION_FLOOR, REPUTATION_CAP);
+    }
+
+    /// Apply a reputation gain that correctly handles the 0.2 boundary.
+    /// Below 0.2: uncapped recovery up to 0.2.
+    /// Above 0.2: velocity-limited.
+    /// Crossing 0.2: split the gain — uncapped portion up to 0.2, remainder velocity-limited.
+    pub fn apply_gain_at_boundary(&mut self, amount: FixedPoint) {
+        if self.overall >= INITIAL_REPUTATION {
+            // Already at or above boundary — fully velocity-limited
+            self.apply_gain(amount);
+        } else {
+            let gap = INITIAL_REPUTATION.saturating_sub(self.overall);
+            if amount.raw() <= gap.raw() {
+                // Entire gain stays below boundary — uncapped
+                self.overall = self.overall.saturating_add(amount);
+            } else {
+                // Split: fill to 0.2 uncapped, remainder velocity-limited
+                self.overall = INITIAL_REPUTATION;
+                let remainder = FixedPoint::from_raw(amount.raw() - gap.raw());
+                self.apply_gain(remainder);
+            }
+            self.overall = self.overall.clamp(REPUTATION_FLOOR, REPUTATION_CAP);
+        }
     }
 
     /// Apply dampened gain per §1 Identity Linking.

@@ -1,4 +1,4 @@
-//! Proposal lifecycle per §6 and vote evaluation per §7.
+//! Proposal lifecycle per §7 and vote evaluation per §8.
 
 use std::collections::HashMap;
 
@@ -23,6 +23,8 @@ pub enum ProposalStatus {
     Adopted,
     /// Voting deadline passed.
     Expired,
+    /// Close-margin confirmation period (margin within ±0.02 of threshold).
+    ConfirmationPeriod,
     /// Author withdrew.
     Withdrawn,
 }
@@ -52,6 +54,8 @@ pub struct ProposalTracker {
     pub votes: HashMap<String, Vote>,
     /// Whether the author has withdrawn this proposal.
     pub withdrawn: bool,
+    /// Deadline for close-margin confirmation period (if active).
+    pub confirmation_deadline_ms: Option<i64>,
     /// Adoption reports (voter_id → success).
     pub adoptions: HashMap<String, bool>,
 }
@@ -71,6 +75,7 @@ impl ProposalTracker {
             status: ProposalStatus::Open,
             votes: HashMap::new(),
             withdrawn: false,
+            confirmation_deadline_ms: None,
             adoptions: HashMap::new(),
         }
     }
@@ -110,7 +115,7 @@ impl ProposalTracker {
         self.adoptions.insert(voter_id, success);
     }
 
-    /// Evaluate the proposal status per §7.
+    /// Evaluate the proposal status per §8.
     /// `local_threshold`: suggested 0.67 for standard, 0.80 for protocol changes.
     /// `now_ms`: current time for deadline checking.
     pub fn evaluate(&mut self, local_threshold: FixedPoint, now_ms: i64) -> &ProposalStatus {
@@ -122,9 +127,48 @@ impl ProposalTracker {
             return &self.status;
         }
 
-        // Check deadline
+        // Check confirmation period deadline
+        if self.status == ProposalStatus::ConfirmationPeriod {
+            if let Some(confirm_deadline) = self.confirmation_deadline_ms {
+                if now_ms > confirm_deadline {
+                    // Confirmation period ended — re-evaluate final result
+                    let eval = self.compute_vote_weights();
+                    let endorse_plus_reject = eval.weighted_endorse.saturating_add(eval.weighted_reject);
+                    if endorse_plus_reject.raw() > 0 {
+                        let ratio = eval.weighted_endorse.div(endorse_plus_reject);
+                        if ratio.raw() >= local_threshold.raw() {
+                            self.status = ProposalStatus::Converging;
+                        } else {
+                            self.status = ProposalStatus::Rejected;
+                        }
+                    } else {
+                        self.status = ProposalStatus::Expired;
+                    }
+                }
+                return &self.status;
+            }
+        }
+
+        // Check voting deadline
         if now_ms > self.voting_deadline_ms {
             if self.status != ProposalStatus::Ratified {
+                // Check if margin is close (within ±0.02 of threshold)
+                let eval = self.compute_vote_weights();
+                let endorse_plus_reject = eval.weighted_endorse.saturating_add(eval.weighted_reject);
+                if endorse_plus_reject.raw() > 0 && eval.distinct_voters >= constants::MINIMUM_VOTERS {
+                    let ratio = eval.weighted_endorse.div(endorse_plus_reject);
+                    let diff = if ratio.raw() >= local_threshold.raw() {
+                        ratio.raw() - local_threshold.raw()
+                    } else {
+                        local_threshold.raw() - ratio.raw()
+                    };
+                    if diff <= constants::CLOSE_MARGIN_THRESHOLD.raw() {
+                        self.status = ProposalStatus::ConfirmationPeriod;
+                        self.confirmation_deadline_ms =
+                            Some(self.voting_deadline_ms + constants::CLOSE_MARGIN_CONFIRMATION_MS);
+                        return &self.status;
+                    }
+                }
                 self.status = ProposalStatus::Expired;
             }
             return &self.status;
@@ -132,7 +176,7 @@ impl ProposalTracker {
 
         let eval = self.compute_vote_weights();
 
-        // §7: All three conditions for ratification
+        // §8: All three conditions for ratification
         let min_voters_met = eval.distinct_voters >= constants::MINIMUM_VOTERS;
         let threshold_met = if eval.weighted_endorse.raw() + eval.weighted_reject.raw() > 0 {
             let ratio = eval.weighted_endorse.div(
