@@ -1,0 +1,14 @@
+[package]
+name = "valence-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+valence-core = { workspace = true }
+valence-crypto = { workspace = true }
