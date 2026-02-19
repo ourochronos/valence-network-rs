@@ -165,12 +165,19 @@ pub fn evaluate_cold_start(
 }
 
 /// Tally votes by weight.
+/// Per §8: Votes from identities below 0.3 rep are excluded from quorum calculation.
 fn tally(votes: &[WeightedVote]) -> (FixedPoint, FixedPoint, FixedPoint, usize) {
     let mut endorse = FixedPoint::ZERO;
     let mut reject = FixedPoint::ZERO;
     let mut abstain = FixedPoint::ZERO;
+    let mut count = 0usize;
 
     for vote in votes {
+        // §8: Exclude votes from identities below minimum rep threshold
+        if vote.weight < MIN_REP_TO_VOTE {
+            continue;
+        }
+        count += 1;
         match vote.stance {
             VoteStance::Endorse => endorse = endorse.saturating_add(vote.weight),
             VoteStance::Reject => reject = reject.saturating_add(vote.weight),
@@ -178,7 +185,7 @@ fn tally(votes: &[WeightedVote]) -> (FixedPoint, FixedPoint, FixedPoint, usize) 
         }
     }
 
-    (endorse, reject, abstain, votes.len())
+    (endorse, reject, abstain, count)
 }
 
 /// Compute the activity multiplier for governance activation timing.
@@ -255,6 +262,36 @@ mod tests {
         let m = activity_multiplier(2, 0.3, 5);
         assert!((m - 2.33).abs() < 0.01);
         assert!((sustain_days(m) - 3.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn votes_below_min_rep_excluded() {
+        let votes = vec![
+            WeightedVote { node_id: "a".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.8) },
+            WeightedVote { node_id: "b".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.7) },
+            WeightedVote { node_id: "c".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.6) },
+            // This vote should be excluded (below 0.3 min rep)
+            WeightedVote { node_id: "d".into(), stance: VoteStance::Reject, weight: FixedPoint::from_f64(0.2) },
+        ];
+        let result = evaluate_standard(&votes, 20, FixedPoint::from_f64(5.2), false);
+        // d's vote excluded: only 3 voters, all endorse
+        assert_eq!(result.total_voters, 3);
+        assert_eq!(result.weighted_reject, FixedPoint::ZERO);
+        assert!(result.threshold_met);
+    }
+
+    #[test]
+    fn votes_at_min_rep_included() {
+        let votes = vec![
+            WeightedVote { node_id: "a".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.8) },
+            WeightedVote { node_id: "b".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.7) },
+            WeightedVote { node_id: "c".into(), stance: VoteStance::Endorse, weight: FixedPoint::from_f64(0.6) },
+            // Exactly at 0.3 — should be included
+            WeightedVote { node_id: "d".into(), stance: VoteStance::Reject, weight: FixedPoint::from_f64(0.3) },
+        ];
+        let result = evaluate_standard(&votes, 20, FixedPoint::from_f64(5.2), false);
+        assert_eq!(result.total_voters, 4);
+        assert_eq!(result.weighted_reject.raw(), 3000); // 0.3
     }
 
     #[test]

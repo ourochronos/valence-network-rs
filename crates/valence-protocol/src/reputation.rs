@@ -38,14 +38,12 @@ impl ReputationState {
     }
 
     /// Apply a reputation gain, respecting velocity limits and cap.
-    /// Below starting rep: uncapped recovery.
+    /// Below starting rep (0.2): uncapped recovery.
     /// Above starting rep: daily/weekly limits apply.
+    /// Correctly handles gains that cross the 0.2 boundary by splitting.
     pub fn apply_gain(&mut self, amount: FixedPoint) {
-        if self.overall < INITIAL_REPUTATION {
-            // Uncapped recovery below starting rep
-            self.overall = self.overall.saturating_add(amount);
-        } else {
-            // Check velocity limits
+        if self.overall >= INITIAL_REPUTATION {
+            // Already at or above boundary — fully velocity-limited
             let remaining_daily = MAX_DAILY_GAIN.saturating_sub(self.daily_earned);
             let remaining_weekly = MAX_WEEKLY_GAIN.saturating_sub(self.weekly_earned);
             let allowed = amount
@@ -55,6 +53,25 @@ impl ReputationState {
             self.overall = self.overall.saturating_add(allowed);
             self.daily_earned = self.daily_earned.saturating_add(allowed);
             self.weekly_earned = self.weekly_earned.saturating_add(allowed);
+        } else {
+            let gap = INITIAL_REPUTATION.saturating_sub(self.overall);
+            if amount.raw() <= gap.raw() {
+                // Entire gain stays below boundary — uncapped
+                self.overall = self.overall.saturating_add(amount);
+            } else {
+                // Split: fill to 0.2 uncapped, remainder velocity-limited
+                self.overall = INITIAL_REPUTATION;
+                let remainder = FixedPoint::from_raw(amount.raw() - gap.raw());
+                let remaining_daily = MAX_DAILY_GAIN.saturating_sub(self.daily_earned);
+                let remaining_weekly = MAX_WEEKLY_GAIN.saturating_sub(self.weekly_earned);
+                let allowed = remainder
+                    .clamp(FixedPoint::ZERO, remaining_daily)
+                    .clamp(FixedPoint::ZERO, remaining_weekly);
+
+                self.overall = self.overall.saturating_add(allowed);
+                self.daily_earned = self.daily_earned.saturating_add(allowed);
+                self.weekly_earned = self.weekly_earned.saturating_add(allowed);
+            }
         }
 
         // Hard cap at 1.0
@@ -157,6 +174,69 @@ impl ReputationState {
         let result = (numerator / FixedPoint::SCALE as i128) as i64;
 
         FixedPoint::from_raw(result).clamp(REPUTATION_FLOOR, REPUTATION_CAP)
+    }
+}
+
+/// Result of distributing an adoption reward with provenance splits per §9/§6.
+#[derive(Debug, Clone)]
+pub struct AdoptionRewardResult {
+    /// Amount credited to the proposal author.
+    pub author_amount: FixedPoint,
+    /// Amount credited to the original host (provenance), if any.
+    pub host_amount: FixedPoint,
+    /// Amount credited to storage providers (30% of total pool).
+    pub storage_provider_amount: FixedPoint,
+}
+
+/// Compute adoption reward distribution per §9.
+/// - Total pool per proposal is capped at ADOPTION_REWARD_CAP (+0.05).
+/// - Storage providers always get 30% of the pool.
+/// - If `origin_share_id` is set (provenance), the host gets 30% of the author's 70%.
+/// - Hosts below 0.3 rep are capped at PROVENANCE_BELOW_THRESHOLD_CAP per proposal.
+pub fn compute_adoption_reward(
+    adopt_count: u32,
+    has_provenance: bool,
+    host_reputation: Option<FixedPoint>,
+) -> AdoptionRewardResult {
+    use valence_core::constants::*;
+
+    // Total reward: adopt_count × 0.005, capped at 0.05
+    let raw_total = FixedPoint::from_raw(
+        (adopt_count as i64 * ADOPTION_REWARD_PER_ADOPT.raw())
+            .min(ADOPTION_REWARD_CAP.raw()),
+    );
+
+    // Storage providers get 30% of total
+    let storage_share = FixedPoint::from_raw(
+        (raw_total.raw() as i128 * PROVENANCE_HOST_SHARE.raw() as i128
+            / FixedPoint::SCALE as i128) as i64,
+    );
+    let author_side = raw_total.saturating_sub(storage_share);
+
+    if has_provenance {
+        let host_rep = host_reputation.unwrap_or(FixedPoint::ZERO);
+        // Host gets 30% of author_side
+        let host_full = FixedPoint::from_raw(
+            (author_side.raw() as i128 * PROVENANCE_HOST_SHARE.raw() as i128
+                / FixedPoint::SCALE as i128) as i64,
+        );
+        let host_amount = if host_rep >= PROVENANCE_MIN_REP {
+            host_full
+        } else {
+            host_full.clamp(FixedPoint::ZERO, PROVENANCE_BELOW_THRESHOLD_CAP)
+        };
+        let author_amount = author_side.saturating_sub(host_amount);
+        AdoptionRewardResult {
+            author_amount,
+            host_amount,
+            storage_provider_amount: storage_share,
+        }
+    } else {
+        AdoptionRewardResult {
+            author_amount: author_side,
+            host_amount: FixedPoint::ZERO,
+            storage_provider_amount: storage_share,
+        }
     }
 }
 
@@ -268,6 +348,71 @@ mod tests {
 
         // Should have gained 0.04/4^0.75 ≈ 0.0141 (dampened)
         assert_eq!(state.overall.raw(), 2141); // 0.2 + 0.0141 = 0.2141
+    }
+
+    #[test]
+    fn velocity_boundary_crossing() {
+        // Start below 0.2, apply gain that crosses boundary
+        let mut state = ReputationState::new();
+        state.overall = FixedPoint::from_f64(0.19); // Below 0.2
+        state.daily_earned = FixedPoint::ZERO;
+        state.weekly_earned = FixedPoint::ZERO;
+
+        // Gain of 0.05: 0.01 uncapped to reach 0.2, remaining 0.04 velocity-limited
+        // But daily cap is 0.02, so only 0.02 of the 0.04 applies
+        state.apply_gain(FixedPoint::from_f64(0.05));
+        // 0.19 + 0.01 (uncapped) + 0.02 (velocity-limited) = 0.22
+        assert_eq!(state.overall.raw(), 2200);
+        assert_eq!(state.daily_earned.raw(), 200); // 0.02
+    }
+
+    #[test]
+    fn velocity_fully_below_boundary() {
+        // Entirely below 0.2 — no velocity limits
+        let mut state = ReputationState::new();
+        state.overall = FixedPoint::from_f64(0.12);
+        state.apply_gain(FixedPoint::from_f64(0.05));
+        assert_eq!(state.overall.raw(), 1700); // 0.12 + 0.05 = 0.17
+        assert_eq!(state.daily_earned, FixedPoint::ZERO); // No velocity tracking below 0.2
+    }
+
+    #[test]
+    fn adoption_reward_no_provenance() {
+        let result = compute_adoption_reward(10, false, None);
+        // 10 × 0.005 = 0.05 (cap)
+        // storage: 30% of 0.05 = 0.015
+        // author: 70% of 0.05 = 0.035
+        assert_eq!(result.storage_provider_amount.raw(), 150);
+        assert_eq!(result.author_amount.raw(), 350);
+        assert_eq!(result.host_amount, FixedPoint::ZERO);
+    }
+
+    #[test]
+    fn adoption_reward_with_provenance_high_rep_host() {
+        let result = compute_adoption_reward(10, true, Some(FixedPoint::from_f64(0.5)));
+        // total = 0.05, storage = 0.015, author_side = 0.035
+        // host gets 30% of 0.035 = 0.0105
+        // author gets 0.035 - 0.0105 = 0.0245
+        assert_eq!(result.storage_provider_amount.raw(), 150);
+        assert_eq!(result.host_amount.raw(), 105);
+        assert_eq!(result.author_amount.raw(), 245);
+    }
+
+    #[test]
+    fn adoption_reward_with_provenance_low_rep_host() {
+        let result = compute_adoption_reward(10, true, Some(FixedPoint::from_f64(0.2)));
+        // host capped at 0.002 = 20
+        assert_eq!(result.host_amount.raw(), 20);
+        assert_eq!(result.storage_provider_amount.raw(), 150);
+        assert_eq!(result.author_amount.raw(), 350 - 20); // 330
+    }
+
+    #[test]
+    fn adoption_reward_capped_at_max() {
+        // 20 adopts × 0.005 = 0.1, but capped at 0.05
+        let result = compute_adoption_reward(20, false, None);
+        let total = result.author_amount.raw() + result.storage_provider_amount.raw();
+        assert_eq!(total, 500); // 0.05
     }
 
     #[test]

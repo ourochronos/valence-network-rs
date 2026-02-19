@@ -82,9 +82,15 @@ impl ProposalTracker {
 
     /// Record a vote. Later votes from the same identity supersede earlier ones (§7).
     /// The `voter_key` is resolved to root identity via `identity_mgr` before storing.
-    pub fn record_vote(&mut self, voter_key: &str, vote: Vote, identity_mgr: &IdentityManager) {
+    /// Per §8: Votes from identities below 0.3 rep MUST be rejected.
+    pub fn record_vote(&mut self, voter_key: &str, vote: Vote, identity_mgr: &IdentityManager) -> bool {
         if self.withdrawn {
-            return; // §6: Stop counting votes for withdrawn proposals
+            return false; // §6: Stop counting votes for withdrawn proposals
+        }
+
+        // §8: Minimum reputation to vote is 0.3
+        if vote.vote_time_reputation < constants::MIN_REP_TO_VOTE {
+            return false;
         }
         
         // Resolve voter key to root identity (§1 Identity Linking)
@@ -92,16 +98,16 @@ impl ProposalTracker {
             .unwrap_or(voter_key); // If not found, use key as-is
         
         let existing = self.votes.get(root_id);
-        if let Some(existing) = existing {
-            if vote.timestamp_ms <= existing.timestamp_ms {
-                return; // Old vote, ignore
+        if let Some(existing) = existing
+            && vote.timestamp_ms <= existing.timestamp_ms {
+                return false; // Old vote, ignore
             }
-        }
         
         // Store vote under root identity, not signing key
         let mut resolved_vote = vote;
         resolved_vote.voter_id = root_id.to_string();
         self.votes.insert(root_id.to_string(), resolved_vote);
+        true
     }
 
     /// Mark as withdrawn.
@@ -128,8 +134,8 @@ impl ProposalTracker {
         }
 
         // Check confirmation period deadline
-        if self.status == ProposalStatus::ConfirmationPeriod {
-            if let Some(confirm_deadline) = self.confirmation_deadline_ms {
+        if self.status == ProposalStatus::ConfirmationPeriod
+            && let Some(confirm_deadline) = self.confirmation_deadline_ms {
                 if now_ms > confirm_deadline {
                     // Confirmation period ended — re-evaluate final result
                     let eval = self.compute_vote_weights();
@@ -147,7 +153,6 @@ impl ProposalTracker {
                 }
                 return &self.status;
             }
-        }
 
         // Check voting deadline
         if now_ms > self.voting_deadline_ms {
@@ -267,7 +272,14 @@ impl ProposalRateLimiter {
 
     /// Check if a key (resolved to root identity) can submit a proposal.
     /// The `key` parameter is resolved to root identity before checking.
-    pub fn can_propose(&self, key: &str, now_ms: i64, identity_mgr: &IdentityManager) -> bool {
+    /// Per §7: Nodes MUST have reputation ≥ 0.3 to submit proposals.
+    pub fn can_propose(&self, key: &str, now_ms: i64, identity_mgr: &IdentityManager, reputation: Option<FixedPoint>) -> bool {
+        // §7: Minimum reputation check
+        if let Some(rep) = reputation
+            && rep < constants::MIN_REP_TO_PROPOSE {
+                return false;
+            }
+
         // Resolve to root identity per §1 Identity Linking
         let identity_id = identity_mgr.resolve_root(key).unwrap_or(key);
         
@@ -327,11 +339,11 @@ mod tests {
         let mgr = make_identity_mgr();
 
         // First vote: endorse
-        tracker.record_vote("voter1", make_vote("voter1", VoteStance::Endorse, 0.5, 1000), &mgr);
+        assert!(tracker.record_vote("voter1", make_vote("voter1", VoteStance::Endorse, 0.5, 1000), &mgr));
         assert_eq!(tracker.votes.len(), 1);
 
         // Second vote from same voter: reject (supersedes)
-        tracker.record_vote("voter1", make_vote("voter1", VoteStance::Reject, 0.5, 2000), &mgr);
+        assert!(tracker.record_vote("voter1", make_vote("voter1", VoteStance::Reject, 0.5, 2000), &mgr));
         assert_eq!(tracker.votes.len(), 1);
         assert_eq!(tracker.votes["voter1"].stance, VoteStance::Reject);
     }
@@ -343,7 +355,7 @@ mod tests {
         );
         let mgr = make_identity_mgr();
         tracker.record_vote("voter1", make_vote("voter1", VoteStance::Endorse, 0.5, 2000), &mgr);
-        tracker.record_vote("voter1", make_vote("voter1", VoteStance::Reject, 0.5, 1000), &mgr); // older
+        assert!(!tracker.record_vote("voter1", make_vote("voter1", VoteStance::Reject, 0.5, 1000), &mgr)); // older
         assert_eq!(tracker.votes["voter1"].stance, VoteStance::Endorse); // kept
     }
 
@@ -355,8 +367,27 @@ mod tests {
         let mgr = make_identity_mgr();
         tracker.record_vote("voter1", make_vote("voter1", VoteStance::Endorse, 0.5, 1000), &mgr);
         tracker.withdraw();
-        tracker.record_vote("voter2", make_vote("voter2", VoteStance::Endorse, 0.5, 2000), &mgr);
+        assert!(!tracker.record_vote("voter2", make_vote("voter2", VoteStance::Endorse, 0.5, 2000), &mgr));
         assert_eq!(tracker.votes.len(), 1); // voter2's vote not counted
+    }
+
+    #[test]
+    fn vote_rejected_below_min_rep() {
+        let mut tracker = ProposalTracker::new(
+            "p1".into(), "author".into(), ProposalTier::Standard, i64::MAX,
+        );
+        let mgr = make_identity_mgr();
+        // Vote with rep 0.2 (below 0.3 minimum)
+        assert!(!tracker.record_vote("voter1", make_vote("voter1", VoteStance::Endorse, 0.2, 1000), &mgr));
+        assert_eq!(tracker.votes.len(), 0);
+
+        // Vote with rep 0.29 (still below)
+        assert!(!tracker.record_vote("voter2", make_vote("voter2", VoteStance::Endorse, 0.29, 1000), &mgr));
+        assert_eq!(tracker.votes.len(), 0);
+
+        // Vote with rep 0.3 (at threshold — accepted)
+        assert!(tracker.record_vote("voter3", make_vote("voter3", VoteStance::Endorse, 0.3, 1000), &mgr));
+        assert_eq!(tracker.votes.len(), 1);
     }
 
     #[test]
@@ -404,6 +435,26 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_close_margin_triggers_confirmation() {
+        let mut tracker = ProposalTracker::new(
+            "p1".into(), "author".into(), ProposalTier::Standard, 1000,
+        );
+        let mgr = make_identity_mgr();
+        // Set up votes so ratio is close to 0.67: e.g. 0.66
+        // endorse=0.66, reject=0.34 → ratio=0.66 which is within ±0.02 of 0.67
+        tracker.record_vote("v1", make_vote("v1", VoteStance::Endorse, 0.33, 500), &mgr);
+        tracker.record_vote("v2", make_vote("v2", VoteStance::Endorse, 0.33, 500), &mgr);
+        tracker.record_vote("v3", make_vote("v3", VoteStance::Reject, 0.34, 500), &mgr);
+        
+        let threshold = FixedPoint::from_f64(0.67);
+        tracker.evaluate(threshold, 2000); // past deadline
+        assert_eq!(tracker.status, ProposalStatus::ConfirmationPeriod);
+        assert!(tracker.confirmation_deadline_ms.is_some());
+        // Confirmation deadline should be voting_deadline + 7 days
+        assert_eq!(tracker.confirmation_deadline_ms.unwrap(), 1000 + constants::CLOSE_MARGIN_CONFIRMATION_MS);
+    }
+
+    #[test]
     fn abstain_doesnt_affect_ratio() {
         let mut tracker = ProposalTracker::new(
             "p1".into(), "author".into(), ProposalTier::Standard, i64::MAX,
@@ -428,14 +479,25 @@ mod tests {
         let mgr = make_identity_mgr();
         let now = 1_000_000i64;
 
-        assert!(limiter.can_propose("alice", now, &mgr));
+        assert!(limiter.can_propose("alice", now, &mgr, Some(FixedPoint::from_f64(0.5))));
         limiter.record_proposal("alice", now, &mgr);
         limiter.record_proposal("alice", now + 1000, &mgr);
         limiter.record_proposal("alice", now + 2000, &mgr);
-        assert!(!limiter.can_propose("alice", now + 3000, &mgr));
+        assert!(!limiter.can_propose("alice", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5))));
 
         // Different identity not affected
-        assert!(limiter.can_propose("bob", now, &mgr));
+        assert!(limiter.can_propose("bob", now, &mgr, Some(FixedPoint::from_f64(0.5))));
+    }
+
+    #[test]
+    fn rate_limiter_rejects_low_rep() {
+        let limiter = ProposalRateLimiter::new();
+        let mgr = make_identity_mgr();
+        // Below 0.3 rep — can't propose regardless of rate limit
+        assert!(!limiter.can_propose("alice", 1_000_000, &mgr, Some(FixedPoint::from_f64(0.2))));
+        assert!(!limiter.can_propose("alice", 1_000_000, &mgr, Some(FixedPoint::from_f64(0.29))));
+        // At 0.3 — allowed
+        assert!(limiter.can_propose("alice", 1_000_000, &mgr, Some(FixedPoint::from_f64(0.3))));
     }
 
     #[test]
@@ -447,11 +509,11 @@ mod tests {
         limiter.record_proposal("alice", now, &mgr);
         limiter.record_proposal("alice", now + 1000, &mgr);
         limiter.record_proposal("alice", now + 2000, &mgr);
-        assert!(!limiter.can_propose("alice", now + 3000, &mgr));
+        assert!(!limiter.can_propose("alice", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5))));
 
         // After 7 days, old proposals expire
         let later = now + constants::PROPOSAL_RATE_WINDOW_MS + 1;
-        assert!(limiter.can_propose("alice", later, &mgr));
+        assert!(limiter.can_propose("alice", later, &mgr, Some(FixedPoint::from_f64(0.5))));
     }
 
     #[test]
@@ -466,10 +528,10 @@ mod tests {
         limiter.transfer("old_key", "new_key");
 
         // After transfer, old_key's record is gone — it CAN propose again
-        assert!(limiter.can_propose("old_key", now + 2000, &mgr));
+        assert!(limiter.can_propose("old_key", now + 2000, &mgr, Some(FixedPoint::from_f64(0.5))));
         // But new_key inherited the 2 proposals
         limiter.record_proposal("new_key", now + 2000, &mgr);
-        assert!(!limiter.can_propose("new_key", now + 3000, &mgr)); // 3 proposals now
+        assert!(!limiter.can_propose("new_key", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5)))); // 3 proposals now
     }
 
     #[test]
@@ -524,18 +586,18 @@ mod tests {
         }, 1000).unwrap();
 
         // Child submits 2 proposals
-        assert!(limiter.can_propose("child_b", now, &mgr));
+        assert!(limiter.can_propose("child_b", now, &mgr, Some(FixedPoint::from_f64(0.5))));
         limiter.record_proposal("child_b", now, &mgr);
         limiter.record_proposal("child_b", now + 1000, &mgr);
 
         // Root tries to submit — should see 2 already (shared limit)
         limiter.record_proposal("root_a", now + 2000, &mgr);
         // Identity now has 3 proposals — limit reached
-        assert!(!limiter.can_propose("root_a", now + 3000, &mgr));
-        assert!(!limiter.can_propose("child_b", now + 3000, &mgr));
+        assert!(!limiter.can_propose("root_a", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5))));
+        assert!(!limiter.can_propose("child_b", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5))));
 
         // Different identity unaffected
         mgr.register_root("unrelated".into());
-        assert!(limiter.can_propose("unrelated", now + 3000, &mgr));
+        assert!(limiter.can_propose("unrelated", now + 3000, &mgr, Some(FixedPoint::from_f64(0.5))));
     }
 }

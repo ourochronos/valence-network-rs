@@ -53,10 +53,18 @@ pub enum ProtocolAction {
 /// Compute scarcity multiplier from network utilization.
 /// Formula: 1 + 99 × utilization^4, cap at 100×.
 /// When total_allocated = 0, returns 1.0.
+///
+/// L-2: `total_available` is the remaining free space within `total_allocated`.
+/// It should always be <= `total_allocated`. When it exceeds `total_allocated`,
+/// utilization is clamped to 0 (no scarcity).
 pub fn scarcity_multiplier(total_allocated: u64, total_available: u64) -> FixedPoint {
     if total_allocated == 0 {
         return FixedPoint::ONE;
     }
+    debug_assert!(
+        total_available <= total_allocated,
+        "total_available ({total_available}) should not exceed total_allocated ({total_allocated})"
+    );
     let utilization = 1.0 - (total_available as f64 / total_allocated as f64);
     let utilization = utilization.clamp(0.0, 1.0);
     let mult = 1.0 + 99.0 * utilization.powi(4);
@@ -226,6 +234,22 @@ mod tests {
         // total_available == total_allocated → utilization = 0
         let m = scarcity_multiplier(1000, 1000);
         assert_eq!(m, FixedPoint::ONE);
+    }
+
+    // ── L-2: scarcity_multiplier documents expected relationship ──
+
+    #[test]
+    fn scarcity_equal_available_and_allocated_is_one() {
+        // L-2: When total_available == total_allocated, utilization = 0, multiplier = 1
+        let m = scarcity_multiplier(1000, 1000);
+        assert_eq!(m, FixedPoint::ONE);
+    }
+
+    #[test]
+    #[should_panic(expected = "total_available")]
+    fn scarcity_debug_asserts_on_available_exceeding_allocated() {
+        // L-2: debug_assert fires when total_available > total_allocated
+        let _ = scarcity_multiplier(100, 200);
     }
 
     #[test]

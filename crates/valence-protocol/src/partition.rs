@@ -111,40 +111,126 @@ pub struct ProtocolProposalInfo {
     pub supersedes: Option<String>,
 }
 
-/// Content state merge: prefer the more "advanced" lifecycle state.
-/// Replicated > Hosted; GracePeriod > Replicated; Decayed > GracePeriod; Withdrawn wins over all non-Decayed.
-/// For same-variant: union semantics (keep the one with the later timestamp or higher miss count).
+/// Content state merge per §12: union semantics.
+/// Content active on *either* partition survives (most alive state wins).
+/// - Active/Replicated > GracePeriod > Decayed
+/// - Withdrawn: only applies if both sides withdrew
+/// - For same-variant Replicated: earliest replication timestamp wins (first writer)
+/// - Flags: union (accumulated from both sides)
+/// - Provenance (`origin_share_id`): earliest SHARE timestamp wins
 pub fn merge_content_state(
     a: crate::content::ContentState,
     b: crate::content::ContentState,
 ) -> crate::content::ContentState {
     use crate::content::ContentState;
+
+    // Union semantics: the "most alive" state wins
+    // Replicated (active) > GracePeriod > Hosted > Decayed
+    // Withdrawn only wins if BOTH sides withdrew
     match (&a, &b) {
-        (ContentState::Decayed, _) | (_, ContentState::Decayed) => ContentState::Decayed,
-        (ContentState::Withdrawn { effective_after: ea }, ContentState::Withdrawn { effective_after: eb }) => {
-            // Earlier withdrawal wins (more conservative)
-            ContentState::Withdrawn { effective_after: (*ea).min(*eb) }
-        }
-        (ContentState::Withdrawn { .. }, _) => a,
-        (_, ContentState::Withdrawn { .. }) => b,
-        (ContentState::GracePeriod { entered_at: ea, miss_count: ma }, ContentState::GracePeriod { entered_at: eb, miss_count: mb }) => {
-            // Higher miss count wins (more conservative)
-            ContentState::GracePeriod {
-                entered_at: (*ea).min(*eb),
-                miss_count: (*ma).max(*mb),
-            }
-        }
-        (ContentState::GracePeriod { .. }, _) => a,
-        (_, ContentState::GracePeriod { .. }) => b,
+        // If either side is actively Replicated, content survives
         (ContentState::Replicated { locked_multiplier: _lm_a, replication_timestamp: ts_a },
          ContentState::Replicated { locked_multiplier: _lm_b, replication_timestamp: ts_b }) => {
-            // Keep earlier replication (first writer wins)
+            // Keep earlier replication (first writer wins for provenance)
             if ts_a <= ts_b { a } else { b }
         }
         (ContentState::Replicated { .. }, _) => a,
         (_, ContentState::Replicated { .. }) => b,
-        _ => a, // Both Hosted
+
+        // If one side is Hosted (active) and the other is degraded, keep active
+        (ContentState::Hosted, ContentState::Decayed) |
+        (ContentState::Hosted, ContentState::GracePeriod { .. }) |
+        (ContentState::Hosted, ContentState::Withdrawn { .. }) => a,
+        (ContentState::Decayed, ContentState::Hosted) |
+        (ContentState::GracePeriod { .. }, ContentState::Hosted) |
+        (ContentState::Withdrawn { .. }, ContentState::Hosted) => b,
+
+        // Both withdrawn: earlier effective_after wins
+        (ContentState::Withdrawn { effective_after: ea }, ContentState::Withdrawn { effective_after: eb }) => {
+            ContentState::Withdrawn { effective_after: (*ea).min(*eb) }
+        }
+        // One withdrawn, other in grace — grace is "more alive"
+        (ContentState::GracePeriod { .. }, ContentState::Withdrawn { .. }) => a,
+        (ContentState::Withdrawn { .. }, ContentState::GracePeriod { .. }) => b,
+        // One withdrawn, other decayed — withdrawn at least has intent
+        (ContentState::Withdrawn { .. }, ContentState::Decayed) => a,
+        (ContentState::Decayed, ContentState::Withdrawn { .. }) => b,
+
+        // GracePeriod vs GracePeriod: lower miss count is "healthier"
+        (ContentState::GracePeriod { entered_at: ea, miss_count: ma },
+         ContentState::GracePeriod { entered_at: eb, miss_count: mb }) => {
+            if ma <= mb {
+                ContentState::GracePeriod { entered_at: *ea, miss_count: *ma }
+            } else {
+                ContentState::GracePeriod { entered_at: *eb, miss_count: *mb }
+            }
+        }
+        // GracePeriod vs Decayed: grace is more alive
+        (ContentState::GracePeriod { .. }, ContentState::Decayed) => a,
+        (ContentState::Decayed, ContentState::GracePeriod { .. }) => b,
+
+        // Both Decayed
+        (ContentState::Decayed, ContentState::Decayed) => ContentState::Decayed,
+
+        // Both Hosted
+        _ => a,
     }
+}
+
+/// Merge flag sets from both partitions (union semantics per §12).
+pub fn merge_flags(
+    flags_a: &[(String, i64)], // (flagger_id, timestamp)
+    flags_b: &[(String, i64)],
+) -> Vec<(String, i64)> {
+    let mut merged: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (id, ts) in flags_a.iter().chain(flags_b.iter()) {
+        merged.entry(id.clone())
+            .and_modify(|existing| *existing = (*existing).min(*ts))
+            .or_insert(*ts);
+    }
+    let mut result: Vec<_> = merged.into_iter().collect();
+    result.sort_by_key(|(_, ts)| *ts);
+    result
+}
+
+/// Merge content provenance: earliest SHARE timestamp wins per §12.
+pub fn merge_provenance(
+    share_a: Option<(String, i64)>, // (share_id, timestamp)
+    share_b: Option<(String, i64)>,
+) -> Option<(String, i64)> {
+    match (share_a, share_b) {
+        (Some(a), Some(b)) => {
+            if a.1 <= b.1 { Some(a) } else { Some(b) }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Invalidate votes cast by revoked keys per §12.
+/// Returns the set of vote IDs that should be invalidated.
+pub fn invalidate_revoked_votes(
+    votes: &[(String, String, i64)], // (vote_id, voter_key, vote_timestamp)
+    revocations: &[(String, i64)],    // (revoked_key, revocation_timestamp)
+) -> Vec<String> {
+    let revocation_map: std::collections::HashMap<&str, i64> = revocations
+        .iter()
+        .map(|(key, ts)| (key.as_str(), *ts))
+        .collect();
+
+    votes
+        .iter()
+        .filter(|(_, voter_key, vote_ts)| {
+            // Invalidate if the voter key was revoked BEFORE the vote timestamp
+            if let Some(&revoke_ts) = revocation_map.get(voter_key.as_str()) {
+                *vote_ts >= revoke_ts
+            } else {
+                false
+            }
+        })
+        .map(|(vote_id, _, _)| vote_id.clone())
+        .collect()
 }
 
 /// Identity merge: DID_REVOKE wins (revocation is permanent).
@@ -275,6 +361,74 @@ mod tests {
         };
         // b has earlier deadline → b wins
         assert_eq!(resolve_protocol_conflict(&a, &b), "b");
+    }
+
+    #[test]
+    fn merge_content_union_active_survives() {
+        use crate::content::ContentState;
+        use valence_core::types::FixedPoint;
+        // Replicated on one side, Decayed on other → Replicated wins (union)
+        let a = ContentState::Replicated {
+            locked_multiplier: FixedPoint::ONE,
+            replication_timestamp: 1000,
+        };
+        let b = ContentState::Decayed;
+        let merged = merge_content_state(a.clone(), b);
+        assert_eq!(merged, a);
+    }
+
+    #[test]
+    fn merge_content_union_grace_over_decayed() {
+        use crate::content::ContentState;
+        let a = ContentState::GracePeriod { entered_at: 5000, miss_count: 1 };
+        let b = ContentState::Decayed;
+        let merged = merge_content_state(a.clone(), b);
+        assert_eq!(merged, a);
+    }
+
+    #[test]
+    fn merge_content_replicated_earliest_wins() {
+        use crate::content::ContentState;
+        use valence_core::types::FixedPoint;
+        let a = ContentState::Replicated { locked_multiplier: FixedPoint::ONE, replication_timestamp: 2000 };
+        let b = ContentState::Replicated { locked_multiplier: FixedPoint::ONE, replication_timestamp: 1000 };
+        let merged = merge_content_state(a, b.clone());
+        assert_eq!(merged, b); // earlier timestamp
+    }
+
+    #[test]
+    fn merge_flags_union() {
+        let flags_a = vec![("alice".to_string(), 100), ("bob".to_string(), 200)];
+        let flags_b = vec![("bob".to_string(), 150), ("carol".to_string(), 300)];
+        let merged = merge_flags(&flags_a, &flags_b);
+        assert_eq!(merged.len(), 3);
+        // bob should have earliest timestamp
+        let bob = merged.iter().find(|(id, _)| id == "bob").unwrap();
+        assert_eq!(bob.1, 150);
+    }
+
+    #[test]
+    fn merge_provenance_earliest_share_wins() {
+        let a = Some(("share_1".to_string(), 2000));
+        let b = Some(("share_2".to_string(), 1000));
+        let result = merge_provenance(a, b);
+        assert_eq!(result.unwrap().0, "share_2");
+    }
+
+    #[test]
+    fn invalidate_votes_by_revoked_keys() {
+        let votes = vec![
+            ("vote1".to_string(), "key_a".to_string(), 5000),
+            ("vote2".to_string(), "key_a".to_string(), 3000),
+            ("vote3".to_string(), "key_b".to_string(), 6000),
+        ];
+        // key_a revoked at timestamp 4000
+        let revocations = vec![("key_a".to_string(), 4000)];
+        let invalidated = invalidate_revoked_votes(&votes, &revocations);
+        // vote1 (ts=5000 >= 4000): invalidated
+        // vote2 (ts=3000 < 4000): NOT invalidated
+        // vote3 (key_b not revoked): NOT invalidated
+        assert_eq!(invalidated, vec!["vote1".to_string()]);
     }
 
     #[test]

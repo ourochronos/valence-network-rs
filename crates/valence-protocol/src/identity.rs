@@ -208,11 +208,10 @@ impl IdentityManager {
             self.implicit_links.insert(new_child.clone());
 
             // Update identity
-            if let Some(identity) = self.identities.get_mut(&root_key) {
-                if let Some(child_info) = identity.children.remove(old_child) {
+            if let Some(identity) = self.identities.get_mut(&root_key)
+                && let Some(child_info) = identity.children.remove(old_child) {
                     identity.children.insert(new_child, child_info);
                 }
-            }
         }
     }
 
@@ -271,6 +270,7 @@ impl IdentityManager {
     }
 
     /// Get all identity groups (for passing to collusion detection).
+    /// Only returns groups with children (for collusion exemption purposes).
     pub fn all_identity_groups(&self) -> Vec<HashSet<String>> {
         self.identities
             .values()
@@ -284,6 +284,11 @@ impl IdentityManager {
                 group
             })
             .collect()
+    }
+
+    /// M-8: Get ALL identities (including solo roots without children) for snapshotting.
+    pub fn all_identities(&self) -> impl Iterator<Item = &Identity> {
+        self.identities.values()
     }
 
     /// Check if a key is permanently revoked.
@@ -523,6 +528,21 @@ mod tests {
         assert!(groups[0].contains("child_b"));
         assert!(groups[0].contains("child_c"));
         assert_eq!(groups[0].len(), 3);
+    }
+
+    // ── M-8: all_identities includes solo roots ──
+
+    #[test]
+    fn all_identities_includes_solo_roots() {
+        let mut mgr = IdentityManager::new();
+        mgr.register_root("solo_root".into());
+        mgr.register_root("another_solo".into());
+
+        // all_identity_groups skips solo roots
+        assert_eq!(mgr.all_identity_groups().len(), 0);
+
+        // all_identities includes them
+        assert_eq!(mgr.all_identities().count(), 2);
     }
 
     #[test]

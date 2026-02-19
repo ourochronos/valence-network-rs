@@ -62,12 +62,24 @@ pub fn vote_correlation(
     (agree as f64 / total as f64, total)
 }
 
+/// L-3: Maximum number of recent votes to analyze for collusion detection.
+/// Limits memory/CPU to O(window²) instead of O(all_votes²).
+const COLLUSION_ANALYSIS_WINDOW: usize = 10_000;
+
 /// Detect collusion groups from voting records per §10.
 /// Flags groups of 3+ nodes with >95% correlation over 20+ proposals.
+/// L-3: Only analyzes the most recent COLLUSION_ANALYSIS_WINDOW votes to bound memory/CPU.
 pub fn detect_vote_collusion(
     all_votes: &[VoteRecord],
     exempt_identity_groups: &[HashSet<String>],
 ) -> Vec<CollusionGroup> {
+    // L-3: Window to recent votes to prevent unbounded memory growth
+    let votes = if all_votes.len() > COLLUSION_ANALYSIS_WINDOW {
+        &all_votes[all_votes.len() - COLLUSION_ANALYSIS_WINDOW..]
+    } else {
+        all_votes
+    };
+    let all_votes = votes;
     // Group votes by node
     let mut by_node: HashMap<&str, Vec<&VoteRecord>> = HashMap::new();
     for vote in all_votes {
@@ -149,14 +161,17 @@ pub fn detect_vote_collusion(
     groups
 }
 
-/// Tenure tracking per §10.
+/// Tenure tracking per §11.
 /// A voting cycle is a rolling 30-day window.
+/// Tenure decay is accelerating: 1st skip: −1, 2nd consecutive: −2, 3rd: −3, etc.
 #[derive(Debug, Clone)]
 pub struct TenureTracker {
     /// Number of consecutive active cycles.
     pub consecutive_cycles: usize,
     /// Whether the node was active in the current cycle.
     pub active_current_cycle: bool,
+    /// Number of consecutive skipped cycles (for accelerating decay).
+    pub consecutive_skips: usize,
 }
 
 impl TenureTracker {
@@ -164,6 +179,7 @@ impl TenureTracker {
         Self {
             consecutive_cycles: 0,
             active_current_cycle: false,
+            consecutive_skips: 0,
         }
     }
 
@@ -175,12 +191,15 @@ impl TenureTracker {
     }
 
     /// Advance to the next cycle.
+    /// §11: Accelerating decay — 1st skip: −1, 2nd consecutive: −2, 3rd: −3, etc.
     pub fn advance_cycle(&mut self) {
         if self.active_current_cycle {
             self.consecutive_cycles += 1;
+            self.consecutive_skips = 0; // Reset skip counter
         } else {
-            // §10: Skipping a cycle decays by 1, not full reset
-            self.consecutive_cycles = self.consecutive_cycles.saturating_sub(1);
+            self.consecutive_skips += 1;
+            // Accelerating decay: nth consecutive skip decays by n
+            self.consecutive_cycles = self.consecutive_cycles.saturating_sub(self.consecutive_skips);
         }
         self.active_current_cycle = false;
     }
@@ -256,7 +275,7 @@ pub fn detect_registration_timing_clusters(
     }
 
     // Deduplicate overlapping clusters (keep largest)
-    clusters.sort_by(|a, b| b.len().cmp(&a.len()));
+    clusters.sort_by_key(|b| std::cmp::Reverse(b.len()));
     let mut seen: HashSet<String> = HashSet::new();
     clusters.retain(|group| {
         let new_nodes: Vec<_> = group.iter().filter(|n| !seen.contains(n.as_str())).collect();
@@ -374,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn tenure_decay_on_skip() {
+    fn tenure_accelerating_decay_on_skip() {
         let mut tracker = TenureTracker::new();
         // 6 active cycles
         for _ in 0..6 {
@@ -383,24 +402,50 @@ mod tests {
         }
         assert_eq!(tracker.consecutive_cycles, 6);
 
-        // Skip 2 cycles → decays by 2
-        tracker.advance_cycle(); // skip
-        tracker.advance_cycle(); // skip
-        assert_eq!(tracker.consecutive_cycles, 4);
+        // §11: Accelerating decay
+        // 1st skip: −1 → 5
+        tracker.advance_cycle();
+        assert_eq!(tracker.consecutive_cycles, 5);
+        // 2nd consecutive skip: −2 → 3
+        tracker.advance_cycle();
+        assert_eq!(tracker.consecutive_cycles, 3);
+        // 3rd consecutive skip: −3 → 0
+        tracker.advance_cycle();
+        assert_eq!(tracker.consecutive_cycles, 0);
     }
 
     #[test]
-    fn tenure_full_reset_requires_many_skips() {
+    fn tenure_full_reset_three_skips() {
         let mut tracker = TenureTracker::new();
         for _ in 0..6 {
             tracker.mark_active();
             tracker.advance_cycle();
         }
-        // Need 6 skips for full reset (§10: "6 months of inactivity")
-        for _ in 0..6 {
+        // §11: 3 consecutive skips = 1+2+3=6, resets from 6 to 0
+        for _ in 0..3 {
             tracker.advance_cycle();
         }
         assert_eq!(tracker.consecutive_cycles, 0);
+    }
+
+    #[test]
+    fn tenure_skip_resets_on_activity() {
+        let mut tracker = TenureTracker::new();
+        for _ in 0..6 {
+            tracker.mark_active();
+            tracker.advance_cycle();
+        }
+        // Skip 1 → −1 = 5
+        tracker.advance_cycle();
+        assert_eq!(tracker.consecutive_cycles, 5);
+        // Active again → resets skip counter, increments to 6
+        tracker.mark_active();
+        tracker.advance_cycle();
+        assert_eq!(tracker.consecutive_cycles, 6);
+        assert_eq!(tracker.consecutive_skips, 0);
+        // Next skip starts from 1 again
+        tracker.advance_cycle(); // −1 → 5
+        assert_eq!(tracker.consecutive_cycles, 5);
     }
 
     #[test]
@@ -417,6 +462,26 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 3);
         assert!(clusters[0].contains(&"a".to_string()));
+    }
+
+    // ── L-3: Collusion detection windows to recent votes ──
+
+    #[test]
+    fn collusion_detection_handles_large_vote_sets() {
+        // L-3: Verify that large vote sets are windowed properly
+        // Create more than COLLUSION_ANALYSIS_WINDOW votes
+        let mut all_votes = Vec::new();
+        for i in 0..11_000 {
+            all_votes.push(VoteRecord {
+                node_id: format!("node_{}", i % 5),
+                proposal_id: format!("prop_{i}"),
+                endorsed: true,
+            });
+        }
+        // Should not panic or take excessive time
+        let groups = detect_vote_collusion(&all_votes, &[]);
+        // Result is valid (may or may not find collusion depending on windowing)
+        let _ = groups;
     }
 
     #[test]
