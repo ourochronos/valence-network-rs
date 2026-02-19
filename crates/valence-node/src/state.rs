@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use valence_network::gossip::MessageRateLimiter;
+use valence_network::shard_store::ShardStore;
 use valence_network::storage::{ContentTransfer, WithdrawTracker};
 use valence_network::sync::{IdentityMerkleTree, SyncManager, SyncServingTracker};
 use valence_protocol::identity::IdentityManager;
@@ -30,6 +31,9 @@ pub struct NodeState {
     pub withdraw_tracker: WithdrawTracker,
     pub proposal_rate_limiter: ProposalRateLimiter,
     pub rate_limiter: MessageRateLimiter,
+
+    // Shard storage (§6)
+    pub shard_store: ShardStore,
 
     // Sync protocol (§5)
     pub sync_manager: SyncManager,
@@ -77,6 +81,11 @@ impl NodeState {
             withdraw_tracker: WithdrawTracker::new(),
             proposal_rate_limiter: ProposalRateLimiter::new(),
             rate_limiter: MessageRateLimiter::new(),
+            shard_store: ShardStore::new(ShardStore::default_dir()).unwrap_or_else(|e| {
+                eprintln!("Failed to initialize shard store: {}", e);
+                // Fall back to current directory if default fails
+                ShardStore::new(PathBuf::from(".valence-node")).expect("Failed to create shard store")
+            }),
             sync_manager: SyncManager::new(false),
             identity_merkle_tree: IdentityMerkleTree::new(),
             sync_serving_tracker: SyncServingTracker::new(),

@@ -2,6 +2,7 @@
 
 
 use tracing::{debug, info, warn};
+use sha2::{Digest, Sha256};
 
 use valence_core::message::{
     Envelope, MessageType,
@@ -94,12 +95,11 @@ pub fn handle_gossip_message(
 
         // §6 Storage challenges
         MessageType::StorageChallenge => {
-            debug!(id = %envelope.id, "Received storage challenge");
-            // TODO: If we hold the challenged shard, compute and send proof
+            let challenge_responses = handle_storage_challenge(state, envelope);
+            responses.extend(challenge_responses);
         }
         MessageType::ChallengeResult => {
-            debug!(id = %envelope.id, "Received challenge result");
-            // TODO: Update provider reputation based on result
+            handle_challenge_result(state, envelope);
         }
 
         // §4 Peer discovery
@@ -342,8 +342,42 @@ fn handle_flag(state: &mut NodeState, envelope: &Envelope) {
 
     match validate_flag(&envelope.payload, rep) {
         ContentValidation::Valid => {
-            info!(id = %envelope.id, from = %envelope.from, "Accepted content flag");
-            // TODO: Initiate content review / quarantine
+            let content_hash = envelope
+                .payload
+                .get("content_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            
+            let flag_type = envelope
+                .payload
+                .get("flag_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other");
+
+            info!(
+                id = %envelope.id,
+                from = %envelope.from,
+                content = %content_hash,
+                flag_type = %flag_type,
+                "Accepted content flag"
+            );
+
+            // Quarantine flagged content
+            if let Err(e) = state.shard_store.quarantine_content(content_hash) {
+                warn!(
+                    content = %content_hash,
+                    error = %e,
+                    "Failed to quarantine flagged content"
+                );
+            }
+
+            // If flag type is "illegal" and we want to be strict, could delete immediately
+            // For now, quarantine allows manual review before deletion
+            if flag_type == "illegal" {
+                // Could track flag count per content and delete after threshold
+                // For now, just quarantine
+                debug!(content = %content_hash, "Illegal content quarantined");
+            }
         }
         other => {
             debug!(id = %envelope.id, result = ?other, "Flag rejected");
@@ -843,6 +877,115 @@ pub fn check_snapshot_publishing(
     state.last_snapshot_publish_ms = Some(now_ms);
 
     responses
+}
+
+// ─── Storage Challenge Handlers ──────────────────────────────────────
+
+fn handle_storage_challenge(state: &mut NodeState, envelope: &Envelope) -> Vec<HandlerResponse> {
+    let content_hash = match envelope.payload.get("content_hash").and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => {
+            debug!(id = %envelope.id, "StorageChallenge missing content_hash");
+            return vec![];
+        }
+    };
+
+    let shard_index = match envelope.payload.get("shard_index").and_then(|v| v.as_u64()) {
+        Some(idx) => idx as u32,
+        None => {
+            debug!(id = %envelope.id, "StorageChallenge missing shard_index");
+            return vec![];
+        }
+    };
+
+    // Check if we hold the challenged shard
+    if !state.shard_store.has_shard(content_hash, shard_index) {
+        debug!(
+            id = %envelope.id,
+            content = %content_hash,
+            shard = shard_index,
+            "StorageChallenge for shard we don't hold"
+        );
+        return vec![];
+    }
+
+    // Read the shard and compute proof hash
+    let shard_data = match state.shard_store.read_shard(content_hash, shard_index) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(
+                id = %envelope.id,
+                content = %content_hash,
+                shard = shard_index,
+                error = %e,
+                "Failed to read shard for challenge"
+            );
+            return vec![];
+        }
+    };
+
+    // Compute SHA-256 proof hash of the shard
+    let proof_hash = hex::encode(Sha256::digest(&shard_data));
+
+    debug!(
+        id = %envelope.id,
+        content = %content_hash,
+        shard = shard_index,
+        proof = %proof_hash,
+        "Responding to storage challenge"
+    );
+
+    // Build ChallengeResponse message
+    // Note: This would need to be signed and published via the gossipsub topic
+    // For now, we return a placeholder response
+    // In a real implementation, this would construct an Envelope and publish it
+    vec![HandlerResponse::None]
+}
+
+fn handle_challenge_result(state: &mut NodeState, envelope: &Envelope) {
+    let provider = match envelope.payload.get("provider").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => {
+            debug!(id = %envelope.id, "ChallengeResult missing provider");
+            return;
+        }
+    };
+
+    let passed = envelope
+        .payload
+        .get("passed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !passed {
+        // Apply reputation penalty for failed challenge
+        let rep = state
+            .reputations
+            .entry(provider.to_string())
+            .or_insert_with(|| {
+                let mut r = valence_protocol::reputation::ReputationState::new();
+                r.overall = FixedPoint::from_f64(0.5);
+                r
+            });
+
+        // Reduce reputation by 10% for failed challenge
+        let penalty = FixedPoint::from_f64(0.1);
+        let new_overall = rep.overall.to_f64() - penalty.to_f64();
+        rep.overall = FixedPoint::from_f64(new_overall.max(0.0));
+
+        warn!(
+            id = %envelope.id,
+            provider = %provider,
+            new_rep = %rep.overall.to_f64(),
+            "Applied reputation penalty for failed storage challenge"
+        );
+    } else {
+        debug!(
+            id = %envelope.id,
+            provider = %provider,
+            "Storage challenge passed"
+        );
+    }
 }
 
 #[cfg(test)]

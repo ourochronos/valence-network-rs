@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod gossip;
+pub mod shard_store;
 pub mod storage;
 pub mod swarm;
 pub mod sync;
