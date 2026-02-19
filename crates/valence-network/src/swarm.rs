@@ -221,6 +221,7 @@ impl ValenceSwarm {
             storage_stats: std::sync::Arc::new(std::sync::RwLock::new(crate::storage::StorageStats {
                 total_bytes: 0,
                 capacity_bytes: 100 * 1024 * 1024 * 1024, // 100 GB default
+                shard_count: 0,
             })),
         };
 
@@ -713,7 +714,7 @@ impl ValenceSwarm {
             Some(StorageCapacity {
                 allocated_bytes: stats.capacity_bytes,
                 available_bytes: stats.capacity_bytes.saturating_sub(stats.total_bytes),
-                shard_count: 0, // TODO: Track actual shard count
+                shard_count: stats.shard_count,
             })
         } else {
             None

@@ -13,6 +13,8 @@ pub struct StorageStats {
     pub total_bytes: u64,
     /// Maximum capacity in bytes.
     pub capacity_bytes: u64,
+    /// Number of shards stored.
+    pub shard_count: u32,
 }
 
 /// A content shard — one piece of an erasure-coded artifact.
