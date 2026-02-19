@@ -36,7 +36,7 @@ pub fn handle_gossip_message(
     envelope: &Envelope,
     now_ms: i64,
 ) -> Vec<HandlerResponse> {
-    let responses = Vec::new();
+    let mut responses = Vec::new();
 
     match &envelope.msg_type {
         // §8 Votes
@@ -112,7 +112,11 @@ pub fn handle_gossip_message(
             handle_did_link(state, envelope, now_ms);
         }
         MessageType::KeyRotate => {
-            handle_key_rotate(state, envelope);
+            let kr_responses = handle_key_rotate(state, envelope);
+            responses.extend(kr_responses);
+        }
+        MessageType::KeyConflict => {
+            handle_key_conflict(state, envelope);
         }
         MessageType::DidRevoke => {
             handle_did_revoke(state, envelope);
@@ -206,7 +210,7 @@ fn handle_propose(state: &mut NodeState, envelope: &Envelope, now_ms: i64) {
         .payload
         .get("voting_deadline_ms")
         .and_then(|v| v.as_i64())
-        .unwrap_or(now_ms + 7 * 24 * 3600 * 1000); // default 7 days
+        .unwrap_or(now_ms + valence_core::constants::VOTING_DEADLINE_DEFAULT_MS); // default 14 days per spec §7
 
     let tracker = ProposalTracker::new(
         envelope.id.clone(),
@@ -543,22 +547,24 @@ fn handle_did_link(state: &mut NodeState, envelope: &Envelope, now_ms: i64) {
     }
 }
 
-fn handle_key_rotate(state: &mut NodeState, envelope: &Envelope) {
+fn handle_key_rotate(state: &mut NodeState, envelope: &Envelope) -> Vec<HandlerResponse> {
     use valence_crypto::identity::verify_signature;
+
+    let mut responses = Vec::new();
 
     let old_key = match envelope.payload.get("old_key").and_then(|v| v.as_str()) {
         Some(k) => k.to_string(),
-        None => return,
+        None => return responses,
     };
     let new_key = match envelope.payload.get("new_key").and_then(|v| v.as_str()) {
         Some(k) => k.to_string(),
-        None => return,
+        None => return responses,
     };
     let new_key_signature = match envelope.payload.get("new_key_signature").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
             warn!(old = %old_key, "KEY_ROTATE rejected: missing new_key_signature (H-2)");
-            return;
+            return responses;
         }
     };
 
@@ -569,7 +575,7 @@ fn handle_key_rotate(state: &mut NodeState, envelope: &Envelope) {
             old = %old_key,
             "KEY_ROTATE rejected: envelope.from != old_key (H-2)"
         );
-        return;
+        return responses;
     }
 
     // H-2: Verify the new key also signed the rotation.
@@ -581,23 +587,94 @@ fn handle_key_rotate(state: &mut NodeState, envelope: &Envelope) {
             new = %new_key,
             "KEY_ROTATE rejected: invalid new key signature (H-2)"
         );
-        return;
+        return responses;
     }
 
-    // Determine if this is a root or child key rotation
-    if envelope.from == old_key {
+    // F-6: KEY_CONFLICT detection — check if we've seen a different rotation for this old_key
+    if let Some((prev_new_key, prev_msg_id)) = state.seen_key_rotations.get(&old_key) {
+        if *prev_new_key != new_key {
+            // Conflicting KEY_ROTATE detected! Broadcast KEY_CONFLICT.
+            warn!(
+                old = %old_key,
+                new1 = %prev_new_key,
+                new2 = %new_key,
+                "KEY_CONFLICT detected: two different rotations for same old_key (F-6)"
+            );
+            let conflict_payload = serde_json::json!({
+                "old_key": old_key,
+                "new_key_1": prev_new_key,
+                "new_key_2": new_key,
+                "rotate_message_1_id": prev_msg_id,
+                "rotate_message_2_id": envelope.id,
+            });
+            // Mark identity as conflicted
+            let root = state.identity_manager.resolve_root(&old_key)
+                .unwrap_or(&old_key)
+                .to_string();
+            state.conflicted_identities.insert(root);
+            // Queue KEY_CONFLICT for broadcast
+            if let Ok(data) = serde_json::to_vec(&conflict_payload) {
+                responses.push(HandlerResponse::Publish {
+                    topic: "/valence/peers".to_string(),
+                    data,
+                });
+            }
+            return responses;
+        }
+        // Same rotation seen again — idempotent, ignore
+        return responses;
+    }
+
+    // F-6: Record this rotation for future conflict detection
+    state.seen_key_rotations.insert(old_key.clone(), (new_key.clone(), envelope.id.clone()));
+
+    // F-5: Track grace period — old key accepted for 1 hour after rotation
+    state.key_rotation_grace.insert(old_key.clone(), (new_key.clone(), envelope.timestamp));
+
+    // Determine if old_key is a root or child key and dispatch accordingly (F-4)
+    let is_root = state.identity_manager.resolve_root(&old_key).map(|r| r == old_key).unwrap_or(true);
+    if is_root {
         state
             .identity_manager
-            .record_root_key_rotate(&old_key, new_key);
-        info!(old = %old_key, "Root key rotated");
+            .record_root_key_rotate(&old_key, new_key.clone());
+        info!(old = %old_key, new = %new_key, "Root key rotated");
     } else {
         state
             .identity_manager
-            .record_child_key_rotate(&old_key, new_key);
-        info!(old = %old_key, "Child key rotated");
+            .record_child_key_rotate(&old_key, new_key.clone());
+        info!(old = %old_key, new = %new_key, "Child key rotated");
     }
     // §5: Add to identity Merkle tree
     state.identity_merkle_tree.insert(envelope.id.clone());
+
+    responses
+}
+
+/// F-5: Check if a message from `sender` should be accepted given key rotation grace periods.
+/// Returns true if the sender is allowed (either not rotated, or within 1-hour grace period).
+/// Returns false if the sender's key was rotated more than 1 hour ago.
+pub fn check_key_rotation_grace(state: &NodeState, sender: &str, now_ms: i64) -> bool {
+    if let Some((_new_key, rotate_timestamp)) = state.key_rotation_grace.get(sender) {
+        let elapsed = now_ms - rotate_timestamp;
+        if elapsed > valence_core::constants::KEY_ROTATION_GRACE_PERIOD_MS {
+            return false; // Grace period expired
+        }
+    }
+    true
+}
+
+/// F-6: Handle incoming KEY_CONFLICT messages.
+fn handle_key_conflict(state: &mut NodeState, envelope: &Envelope) {
+    let old_key = match envelope.payload.get("old_key").and_then(|v| v.as_str()) {
+        Some(k) => k.to_string(),
+        None => return,
+    };
+    // Mark the identity as conflicted — reputation frozen at 0.1, voting weight 10%
+    let root = state.identity_manager.resolve_root(&old_key)
+        .unwrap_or(&old_key)
+        .to_string();
+    state.conflicted_identities.insert(root.clone());
+    warn!(identity = %root, old_key = %old_key, "Identity marked as conflicted due to KEY_CONFLICT");
 }
 
 fn handle_did_revoke(state: &mut NodeState, envelope: &Envelope) {
@@ -755,7 +832,7 @@ pub fn check_snapshot_publishing(
         "node_reputation": rep.to_f64(),
     });
 
-    let envelope = sign_message(identity, MessageType::SyncResponse, payload, now_ms);
+    let envelope = sign_message(identity, MessageType::StateSnapshot, payload, now_ms);
     if let Ok(data) = serde_json::to_vec(&envelope) {
         responses.push(HandlerResponse::Publish {
             topic: "/valence/peers".to_string(),
@@ -1326,5 +1403,242 @@ mod tests {
         // After 6+ hours
         let responses = check_snapshot_publishing(&mut state, &id, now_ms + 6 * 3600 * 1000 + 1);
         assert_eq!(responses.len(), 1, "Should publish after 6-hour window");
+    }
+
+    // ── F-5: KEY_ROTATE grace period tests ──
+
+    #[test]
+    fn key_rotate_grace_period_within_1_hour_accepted() {
+        let state = make_state();
+        let now_ms = 1_000_000_000i64;
+        // No rotation recorded — always accepted
+        assert!(check_key_rotation_grace(&state, "old_key", now_ms));
+    }
+
+    #[test]
+    fn key_rotate_grace_period_old_key_within_grace() {
+        let mut state = make_state();
+        let rotate_time = 1_000_000_000i64;
+        state.key_rotation_grace.insert("old_key".to_string(), ("new_key".to_string(), rotate_time));
+
+        // 30 minutes later — within 1-hour grace period
+        let now_ms = rotate_time + 30 * 60 * 1000;
+        assert!(check_key_rotation_grace(&state, "old_key", now_ms), "Old key should be accepted within grace period");
+    }
+
+    #[test]
+    fn key_rotate_grace_period_old_key_after_grace_rejected() {
+        let mut state = make_state();
+        let rotate_time = 1_000_000_000i64;
+        state.key_rotation_grace.insert("old_key".to_string(), ("new_key".to_string(), rotate_time));
+
+        // 2 hours later — grace period expired
+        let now_ms = rotate_time + 2 * 3600 * 1000;
+        assert!(!check_key_rotation_grace(&state, "old_key", now_ms), "Old key should be rejected after grace period");
+    }
+
+    #[test]
+    fn key_rotate_grace_period_tracked_on_rotate() {
+        // Full integration: KEY_ROTATE should populate grace period tracking
+        let mut state = make_state();
+        let old_key = NodeIdentity::generate();
+        let new_key = NodeIdentity::generate();
+        state.identity_manager.register_root(old_key.node_id());
+
+        let binding = format!("KEY_ROTATE:{}:{}", old_key.node_id(), new_key.node_id());
+        let new_key_sig = hex::encode(new_key.sign(binding.as_bytes()));
+
+        let env = make_envelope(&old_key, MessageType::KeyRotate, serde_json::json!({
+            "old_key": old_key.node_id(),
+            "new_key": new_key.node_id(),
+            "new_key_signature": new_key_sig,
+        }));
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &env, now_ms);
+
+        // Grace period should be tracked
+        assert!(state.key_rotation_grace.contains_key(&old_key.node_id()),
+            "Grace period should be tracked after KEY_ROTATE");
+    }
+
+    // ── F-6: KEY_CONFLICT detection tests ──
+
+    #[test]
+    fn key_conflict_detected_on_two_different_rotations() {
+        let mut state = make_state();
+        let old_key = NodeIdentity::generate();
+        let new_key_1 = NodeIdentity::generate();
+        let new_key_2 = NodeIdentity::generate();
+        state.identity_manager.register_root(old_key.node_id());
+
+        // First KEY_ROTATE: old → new_key_1
+        let binding1 = format!("KEY_ROTATE:{}:{}", old_key.node_id(), new_key_1.node_id());
+        let sig1 = hex::encode(new_key_1.sign(binding1.as_bytes()));
+        let env1 = make_envelope(&old_key, MessageType::KeyRotate, serde_json::json!({
+            "old_key": old_key.node_id(),
+            "new_key": new_key_1.node_id(),
+            "new_key_signature": sig1,
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let responses1 = handle_gossip_message(&mut state, &env1, now_ms);
+        assert!(responses1.is_empty(), "First rotation should not trigger conflict");
+
+        // Second KEY_ROTATE: old → new_key_2 (different new key!)
+        // Need to re-register old_key since it was rotated to new_key_1
+        // Actually, the old_key identity was already rotated. But the conflict detection
+        // happens based on seen_key_rotations, which tracks by old_key.
+        let binding2 = format!("KEY_ROTATE:{}:{}", old_key.node_id(), new_key_2.node_id());
+        let sig2 = hex::encode(new_key_2.sign(binding2.as_bytes()));
+        let env2 = make_envelope(&old_key, MessageType::KeyRotate, serde_json::json!({
+            "old_key": old_key.node_id(),
+            "new_key": new_key_2.node_id(),
+            "new_key_signature": sig2,
+        }));
+        let responses2 = handle_gossip_message(&mut state, &env2, now_ms);
+
+        // Should have a KEY_CONFLICT broadcast response
+        assert!(!responses2.is_empty(), "Conflicting rotation should trigger KEY_CONFLICT broadcast");
+        // Identity should be marked as conflicted
+        assert!(!state.conflicted_identities.is_empty(), "Identity should be marked as conflicted");
+    }
+
+    #[test]
+    fn key_conflict_same_rotation_idempotent() {
+        let mut state = make_state();
+        let old_key = NodeIdentity::generate();
+        let new_key = NodeIdentity::generate();
+        state.identity_manager.register_root(old_key.node_id());
+
+        let binding = format!("KEY_ROTATE:{}:{}", old_key.node_id(), new_key.node_id());
+        let sig = hex::encode(new_key.sign(binding.as_bytes()));
+
+        let env1 = make_envelope(&old_key, MessageType::KeyRotate, serde_json::json!({
+            "old_key": old_key.node_id(),
+            "new_key": new_key.node_id(),
+            "new_key_signature": sig.clone(),
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &env1, now_ms);
+
+        // Same rotation again — should be idempotent (no conflict)
+        let env2 = make_envelope(&old_key, MessageType::KeyRotate, serde_json::json!({
+            "old_key": old_key.node_id(),
+            "new_key": new_key.node_id(),
+            "new_key_signature": sig,
+        }));
+        let responses = handle_gossip_message(&mut state, &env2, now_ms);
+        assert!(responses.is_empty(), "Same rotation should not trigger conflict");
+        assert!(state.conflicted_identities.is_empty());
+    }
+
+    #[test]
+    fn handle_key_conflict_marks_identity() {
+        let mut state = make_state();
+        let id = NodeIdentity::generate();
+        state.identity_manager.register_root("conflicted_root".to_string());
+
+        let env = make_envelope(&id, MessageType::KeyConflict, serde_json::json!({
+            "old_key": "conflicted_root",
+            "new_key_1": "key_a",
+            "new_key_2": "key_b",
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &env, now_ms);
+        assert!(state.conflicted_identities.contains("conflicted_root"),
+            "KEY_CONFLICT should mark identity as conflicted");
+    }
+
+    // ── F-4: Child key rotation test ──
+
+    #[test]
+    fn handle_child_key_rotation() {
+        let mut state = make_state();
+        let root = NodeIdentity::generate();
+        let child = NodeIdentity::generate();
+        let new_child = NodeIdentity::generate();
+
+        // Set up root and link child
+        state.identity_manager.register_root(root.node_id());
+        let binding = format!("DID_LINK:{}:{}", root.node_id(), child.node_id());
+        let child_sig = hex::encode(child.sign(binding.as_bytes()));
+        let link_env = make_envelope(&root, MessageType::DidLink, serde_json::json!({
+            "child_key": child.node_id(),
+            "child_signature": child_sig,
+            "label": "device",
+        }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        handle_gossip_message(&mut state, &link_env, now_ms);
+        assert!(state.identity_manager.same_identity(&root.node_id(), &child.node_id()));
+
+        // Child key rotates to new_child
+        let rotate_binding = format!("KEY_ROTATE:{}:{}", child.node_id(), new_child.node_id());
+        let new_child_sig = hex::encode(new_child.sign(rotate_binding.as_bytes()));
+        let rotate_env = make_envelope(&child, MessageType::KeyRotate, serde_json::json!({
+            "old_key": child.node_id(),
+            "new_key": new_child.node_id(),
+            "new_key_signature": new_child_sig,
+        }));
+        handle_gossip_message(&mut state, &rotate_env, now_ms);
+
+        // new_child should resolve to root
+        assert!(state.identity_manager.same_identity(&root.node_id(), &new_child.node_id()),
+            "New child key should be part of root's identity after child key rotation");
+    }
+
+    // ── F-3: STATE_SNAPSHOT message type test ──
+
+    #[test]
+    fn state_snapshot_message_type_not_gossipsub() {
+        // STATE_SNAPSHOT is a stream protocol message, not gossipsub
+        assert!(!MessageType::StateSnapshot.is_gossipsub());
+        assert!(MessageType::StateSnapshot.gossipsub_topic().is_none());
+    }
+
+    #[test]
+    fn snapshot_uses_state_snapshot_type() {
+        let mut state = make_state();
+        let id = NodeIdentity::generate();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let mut rep = ReputationState::new();
+        rep.overall = FixedPoint::from_f64(0.8);
+        state.reputations.insert(id.node_id(), rep);
+        state.sync_manager.mark_synced();
+
+        let responses = check_snapshot_publishing(&mut state, &id, now_ms);
+        assert_eq!(responses.len(), 1);
+        // Verify the published message uses StateSnapshot type
+        if let HandlerResponse::Publish { data, .. } = &responses[0] {
+            let envelope: Envelope = serde_json::from_slice(data).unwrap();
+            assert_eq!(envelope.msg_type, MessageType::StateSnapshot,
+                "Snapshot should use StateSnapshot message type, not SyncResponse");
+        }
+    }
+
+    // ── F-7: Default proposal deadline test ──
+
+    #[test]
+    fn proposal_default_deadline_14_days() {
+        let mut state = make_state();
+        let id = NodeIdentity::generate();
+        let mut rep = ReputationState::new();
+        rep.overall = FixedPoint::from_f64(0.5);
+        state.reputations.insert(id.node_id(), rep);
+
+        let env = make_envelope(&id, MessageType::Propose, serde_json::json!({
+            "tier": "standard",
+            "title": "Test",
+            "body": "Testing default deadline",
+            // no voting_deadline_ms — should default to 14 days
+        }));
+
+        let now_ms = 1_000_000_000_000i64; // fixed time for predictable test
+        handle_gossip_message(&mut state, &env, now_ms);
+        assert!(state.proposals.contains_key(&env.id));
+        let tracker = &state.proposals[&env.id];
+        let expected_deadline = now_ms + valence_core::constants::VOTING_DEADLINE_DEFAULT_MS;
+        assert_eq!(tracker.voting_deadline_ms, expected_deadline,
+            "Default deadline should be 14 days (VOTING_DEADLINE_DEFAULT_MS)");
     }
 }

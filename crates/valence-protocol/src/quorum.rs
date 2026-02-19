@@ -128,34 +128,55 @@ pub fn evaluate_constitutional(
 }
 
 /// Evaluate during cold start (headcount mode).
+/// Per §5/§8: Degraded nodes' votes count as 0.5 in headcount tally.
 pub fn evaluate_cold_start(
     votes: &[WeightedVote],
     active_nodes: usize,
 ) -> QuorumResult {
+    // §5/§8: Degraded nodes' votes count as 0.5 in cold start headcount mode.
+    // The degraded multiplier is encoded in the weight field as 5000 (0.5).
+    // Synced nodes have weight = their full reputation (typically >= 10000 raw or their rep).
+    // We detect degraded status by checking if weight == degraded multiplier exactly (5000).
+    let degraded_multiplier = FixedPoint::from_raw(5_000);
+
+    let mut endorse_fp = 0i64; // ×10000
+    let mut reject_fp = 0i64;
+    let mut abstain_fp = 0i64;
+    let mut total_fp = 0i64;
     let total_voters = votes.len();
-    let endorse_count = votes.iter().filter(|v| v.stance == VoteStance::Endorse).count();
-    let reject_count = votes.iter().filter(|v| v.stance == VoteStance::Reject).count();
 
-    // Majority of known nodes must vote
-    let quorum_met = total_voters * 2 > active_nodes;
+    for vote in votes {
+        // If the vote carries the degraded multiplier (5000 = 50%), count as 0.5 vote
+        let vote_value: i64 = if vote.weight == degraded_multiplier {
+            5_000 // 0.5 in fixed-point
+        } else {
+            10_000 // 1.0 in fixed-point
+        };
+        total_fp += vote_value;
+        match vote.stance {
+            VoteStance::Endorse => endorse_fp += vote_value,
+            VoteStance::Reject => reject_fp += vote_value,
+            VoteStance::Abstain => abstain_fp += vote_value,
+        }
+    }
 
-    // >67% endorse (by count, not weight)
-    let threshold_met = if endorse_count + reject_count > 0 {
-        endorse_count * 10000 / (endorse_count + reject_count) >= 6700
+    // Majority of known nodes must vote (using weighted headcount)
+    // total_fp / 10000 > active_nodes / 2  →  total_fp * 2 > active_nodes * 10000
+    let quorum_met = total_fp * 2 > active_nodes as i64 * 10_000;
+
+    // >67% endorse (by headcount, not reputation weight)
+    let threshold_met = if endorse_fp + reject_fp > 0 {
+        endorse_fp * 10_000 / (endorse_fp + reject_fp) >= 6_700
     } else {
         false
     };
 
     let ratified = quorum_met && threshold_met;
 
-    // Report as fixed-point for consistency (1.0 per vote in headcount mode)
-    let fp_one = FixedPoint::ONE;
     QuorumResult {
-        weighted_endorse: FixedPoint::from_raw(endorse_count as i64 * fp_one.raw()),
-        weighted_reject: FixedPoint::from_raw(reject_count as i64 * fp_one.raw()),
-        weighted_abstain: FixedPoint::from_raw(
-            (total_voters - endorse_count - reject_count) as i64 * fp_one.raw(),
-        ),
+        weighted_endorse: FixedPoint::from_raw(endorse_fp),
+        weighted_reject: FixedPoint::from_raw(reject_fp),
+        weighted_abstain: FixedPoint::from_raw(abstain_fp),
         total_voters,
         quorum_met,
         threshold_met,
@@ -292,6 +313,51 @@ mod tests {
         let result = evaluate_standard(&votes, 20, FixedPoint::from_f64(5.2), false);
         assert_eq!(result.total_voters, 4);
         assert_eq!(result.weighted_reject.raw(), 3000); // 0.3
+    }
+
+    #[test]
+    fn cold_start_degraded_votes_count_half() {
+        // §5/§8: In cold start headcount mode, degraded nodes' votes count as 0.5
+        // 6 synced voters (weight != 5000) + 4 degraded voters (weight = 5000 exactly)
+        // Effective headcount: 6×1.0 + 4×0.5 = 8.0
+        let mut votes: Vec<WeightedVote> = (0..6)
+            .map(|i| WeightedVote {
+                node_id: format!("synced_{}", i),
+                stance: VoteStance::Endorse,
+                weight: FixedPoint::from_f64(0.8), // synced nodes have their reputation as weight
+            })
+            .collect();
+        for i in 0..4 {
+            votes.push(WeightedVote {
+                node_id: format!("degraded_{}", i),
+                stance: VoteStance::Endorse,
+                weight: FixedPoint::from_raw(5_000), // degraded multiplier = 0.5
+            });
+        }
+
+        // 15 active nodes. Effective headcount = 8.0. Need >50% = >7.5. 8.0 > 7.5 ✓
+        let result = evaluate_cold_start(&votes, 15);
+        assert!(result.quorum_met, "8.0 effective votes / 15 nodes should meet quorum");
+        assert!(result.ratified);
+
+        // Now test that without the degraded discount it would barely NOT meet quorum
+        // 16 active nodes. Effective headcount = 8.0. Need >8.0. 8.0 !> 8.0 ✗
+        let result2 = evaluate_cold_start(&votes, 16);
+        assert!(!result2.quorum_met, "8.0 effective votes / 16 nodes should NOT meet quorum");
+    }
+
+    #[test]
+    fn cold_start_all_degraded_count_half() {
+        // All degraded: 4 voters × 0.5 = 2.0 effective, need >50% of 3 nodes = >1.5
+        let votes: Vec<WeightedVote> = (0..4)
+            .map(|i| WeightedVote {
+                node_id: format!("degraded_{}", i),
+                stance: VoteStance::Endorse,
+                weight: FixedPoint::from_raw(5_000), // degraded
+            })
+            .collect();
+        let result = evaluate_cold_start(&votes, 3);
+        assert!(result.quorum_met, "2.0 effective votes / 3 nodes should meet quorum");
     }
 
     #[test]

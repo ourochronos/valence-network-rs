@@ -43,6 +43,18 @@ pub struct NodeState {
     // Snapshot publishing tracking (§5)
     pub last_snapshot_publish_ms: Option<i64>,
 
+    // KEY_ROTATE grace period tracking (§1, F-5)
+    // Maps old_key → (new_key, rotate_timestamp_ms)
+    pub key_rotation_grace: HashMap<String, (String, i64)>,
+
+    // KEY_CONFLICT detection (§1, F-6)
+    // Maps old_key → (first_new_key, first_rotate_message_id)
+    pub seen_key_rotations: HashMap<String, (String, String)>,
+
+    // Conflicted identities (from KEY_CONFLICT)
+    // Set of root keys that have been flagged as conflicted
+    pub conflicted_identities: std::collections::HashSet<String>,
+
     // Persistence tracking
     events_since_checkpoint: u64,
     last_checkpoint: Instant,
@@ -70,6 +82,9 @@ impl NodeState {
             sync_serving_tracker: SyncServingTracker::new(),
             last_rent_cycle: 0,
             last_snapshot_publish_ms: None,
+            key_rotation_grace: HashMap::new(),
+            seen_key_rotations: HashMap::new(),
+            conflicted_identities: std::collections::HashSet::new(),
             events_since_checkpoint: 0,
             last_checkpoint: Instant::now(),
         }

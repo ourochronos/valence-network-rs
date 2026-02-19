@@ -23,6 +23,7 @@ pub enum MessageType {
     // §5 Gossip
     SyncRequest,
     SyncResponse,
+    StateSnapshot,
     // §6 Content
     Share,
     ReplicateRequest,
