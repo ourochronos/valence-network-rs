@@ -645,4 +645,141 @@ mod tests {
         let (s2, _, _) = ValenceSwarm::new(id2, test_config()).unwrap();
         assert_ne!(s1.local_peer_id(), s2.local_peer_id());
     }
+
+    // ── Auth handshake with VDF tests ──
+
+    #[tokio::test]
+    async fn auth_response_includes_vdf_proof() {
+        let identity = NodeIdentity::generate();
+        let config = test_config();
+        let (mut swarm, _, _) = ValenceSwarm::new(identity.clone(), config).unwrap();
+
+        // Set VDF proof
+        let proof = valence_crypto::vdf::compute(&identity.public_key_bytes(), 10);
+        let vdf_json = serde_json::json!({
+            "output": hex::encode(&proof.output),
+            "input_data": hex::encode(&proof.input_data),
+            "difficulty": proof.difficulty,
+            "computed_at": proof.computed_at,
+            "checkpoints": proof.checkpoints.iter().map(|cp| serde_json::json!({
+                "iteration": cp.iteration,
+                "hash": hex::encode(&cp.hash),
+            })).collect::<Vec<_>>(),
+        });
+        swarm.set_vdf_proof(vdf_json.clone());
+
+        // Create a challenge and response
+        let challenge = crate::gossip::AuthChallenge::new("test_initiator_key");
+        let response = swarm.create_auth_response(&challenge);
+
+        assert_eq!(response.vdf_proof, vdf_json);
+        assert_eq!(response.public_key, identity.node_id());
+    }
+
+    #[tokio::test]
+    async fn verify_and_authenticate_valid_peer() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+
+        let config = test_config();
+        let (mut alice_swarm, _, _) = ValenceSwarm::new(alice.clone(), config.clone()).unwrap();
+
+        // Bob's VDF proof
+        let bob_proof = valence_crypto::vdf::compute(&bob.public_key_bytes(), 10);
+        let bob_vdf_json = serde_json::json!({
+            "output": hex::encode(&bob_proof.output),
+            "input_data": hex::encode(&bob_proof.input_data),
+            "difficulty": bob_proof.difficulty,
+            "computed_at": bob_proof.computed_at,
+            "checkpoints": bob_proof.checkpoints.iter().map(|cp| serde_json::json!({
+                "iteration": cp.iteration,
+                "hash": hex::encode(&cp.hash),
+            })).collect::<Vec<_>>(),
+        });
+
+        // Simulate: Alice sends challenge, Bob responds
+        let challenge = auth::create_challenge(&alice);
+        let bob_response = auth::create_response(&bob, &challenge, bob_vdf_json);
+
+        // We need to insert a pending auth for a fake peer_id
+        let bob_peer_id: PeerId = PeerId::random();
+        alice_swarm.pending_auth.insert(bob_peer_id, (challenge, std::time::Instant::now()));
+
+        let result = alice_swarm.verify_and_authenticate_peer(bob_peer_id, &bob_response);
+        assert!(result.is_ok(), "Valid auth should succeed: {:?}", result);
+        assert_eq!(result.unwrap(), bob.node_id());
+        assert!(alice_swarm.authenticated_peers.contains(&bob_peer_id));
+        assert!(!alice_swarm.pending_auth.contains_key(&bob_peer_id));
+    }
+
+    #[tokio::test]
+    async fn verify_and_authenticate_rejects_missing_vdf() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+
+        let config = test_config();
+        let (mut alice_swarm, _, _) = ValenceSwarm::new(alice.clone(), config).unwrap();
+
+        let challenge = auth::create_challenge(&alice);
+        let bob_response = auth::create_response(&bob, &challenge, serde_json::json!({}));
+
+        let bob_peer_id = PeerId::random();
+        alice_swarm.pending_auth.insert(bob_peer_id, (challenge, std::time::Instant::now()));
+
+        let result = alice_swarm.verify_and_authenticate_peer(bob_peer_id, &bob_response);
+        assert!(result.is_err(), "Should reject missing VDF proof");
+        assert!(!alice_swarm.authenticated_peers.contains(&bob_peer_id));
+    }
+
+    #[tokio::test]
+    async fn verify_and_authenticate_rejects_wrong_key_vdf() {
+        let alice = NodeIdentity::generate();
+        let bob = NodeIdentity::generate();
+        let charlie = NodeIdentity::generate();
+
+        let config = test_config();
+        let (mut alice_swarm, _, _) = ValenceSwarm::new(alice.clone(), config).unwrap();
+
+        // VDF proof for charlie, not bob
+        let wrong_proof = valence_crypto::vdf::compute(&charlie.public_key_bytes(), 10);
+        let wrong_vdf_json = serde_json::json!({
+            "output": hex::encode(&wrong_proof.output),
+            "input_data": hex::encode(&wrong_proof.input_data),
+            "difficulty": wrong_proof.difficulty,
+            "computed_at": wrong_proof.computed_at,
+            "checkpoints": wrong_proof.checkpoints.iter().map(|cp| serde_json::json!({
+                "iteration": cp.iteration,
+                "hash": hex::encode(&cp.hash),
+            })).collect::<Vec<_>>(),
+        });
+
+        let challenge = auth::create_challenge(&alice);
+        let bob_response = auth::create_response(&bob, &challenge, wrong_vdf_json);
+
+        let bob_peer_id = PeerId::random();
+        alice_swarm.pending_auth.insert(bob_peer_id, (challenge, std::time::Instant::now()));
+
+        let result = alice_swarm.verify_and_authenticate_peer(bob_peer_id, &bob_response);
+        assert!(result.is_err(), "Should reject VDF for wrong key");
+        assert!(result.unwrap_err().contains("VDF input"));
+    }
+
+    #[tokio::test]
+    async fn pending_and_authenticated_peer_counts() {
+        let identity = NodeIdentity::generate();
+        let config = test_config();
+        let (mut swarm, _, _) = ValenceSwarm::new(identity, config).unwrap();
+
+        assert_eq!(swarm.authenticated_peer_count(), 0);
+        assert_eq!(swarm.pending_peer_count(), 0);
+
+        let peer = PeerId::random();
+        let challenge = auth::create_challenge(&swarm.identity);
+        swarm.pending_auth.insert(peer, (challenge, std::time::Instant::now()));
+        assert_eq!(swarm.pending_peer_count(), 1);
+
+        swarm.authenticate_peer(peer, "some_node_id".to_string());
+        assert_eq!(swarm.authenticated_peer_count(), 1);
+        assert_eq!(swarm.pending_peer_count(), 0);
+    }
 }
